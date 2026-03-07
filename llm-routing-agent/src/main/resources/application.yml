@@ -1,0 +1,29 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: llm-routing-agent
+  ai:
+    dashscope:
+      api-key: ${AI_DASHSCOPE_API_KEY:sk-c5f8321b1dc84c09994f4aaa7476cc9c}
+      chat:
+        options:
+          model: qwen-plus
+    alibaba:
+      a2a:
+        nacos:
+          server-addr: ${NACOS_ADDR:127.0.0.1:8848}
+          username: nacos
+          password: nacos
+          discovery:
+            enabled: true
+          registry:
+            enabled: false
+        server:
+          enabled: false
+
+logging:
+  level:
+    com.oneask: DEBUG
+    com.alibaba.cloud.ai: DEBUG

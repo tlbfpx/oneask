@@ -1,0 +1,94 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: nacos-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: nacos123
+      MYSQL_DATABASE: nacos_config
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      - oneask-network
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+
+  nacos:
+    image: nacos/nacos-server:v3.1.1
+    container_name: nacos-server
+    environment:
+      - MODE=standalone
+      - PREFER_HOST_MODE=hostname
+      - SPRING_DATASOURCE_PLATFORM=mysql
+      - MYSQL_SERVICE_HOST=mysql
+      - MYSQL_SERVICE_PORT=3306
+      - MYSQL_SERVICE_DB_NAME=nacos_config
+      - MYSQL_SERVICE_USER=root
+      - MYSQL_SERVICE_PASSWORD=nacos123
+      - MYSQL_SERVICE_DB_PARAM=characterEncoding=utf8&connectTimeout=10000&socketTimeout=30000&autoReconnect=true&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+      - JVM_XMS=512m
+      - JVM_XMX=512m
+      - JVM_XMN=256m
+      - NACOS_AUTH_ENABLE=false
+      - NACOS_AUTH_TOKEN=SecretKey012345678901234567890123456789012345678901234567890123456789
+      - NACOS_AUTH_IDENTITY_KEY=serverIdentity
+      - NACOS_AUTH_IDENTITY_VALUE=securityValue
+    volumes:
+      - nacos-logs:/home/nacos/logs
+    ports:
+      - "8848:8848"
+      - "8080:8080"
+      - "9848:9848"
+      - "9849:9849"
+    depends_on:
+      - mysql
+    networks:
+      - oneask-network
+
+  customer-service-agent:
+    build:
+      context: .
+      dockerfile: customer-service-agent/Dockerfile
+    container_name: customer-service-agent
+    ports:
+      - "8081:8081"
+    depends_on:
+      - nacos
+    environment:
+      - NACOS_ADDR=nacos:8848
+      - AI_DASHSCOPE_API_KEY=${AI_DASHSCOPE_API_KEY}
+      - BAIDU_MAP_AK=${BAIDU_MAP_AK}
+    networks:
+      - oneask-network
+
+  llm-routing-agent:
+    build:
+      context: .
+      dockerfile: llm-routing-agent/Dockerfile
+    container_name: llm-routing-agent
+    ports:
+      - "8082:8082"
+    depends_on:
+      - nacos
+      - customer-service-agent
+    environment:
+      - NACOS_ADDR=nacos:8848
+      - AI_DASHSCOPE_API_KEY=${AI_DASHSCOPE_API_KEY}
+    networks:
+      - oneask-network
+
+  frontend:
+    build: ./frontend
+    container_name: frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - llm-routing-agent
+    networks:
+      - oneask-network
+
+networks:
+  oneask-network:
+    driver: bridge
+
+volumes:
+  mysql-data:
+  nacos-logs:
