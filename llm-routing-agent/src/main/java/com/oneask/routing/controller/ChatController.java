@@ -150,7 +150,7 @@ public class ChatController {
         if (output != null) {
             String content = extractContentFromObject(output);
             if (content != null && !content.isBlank()) {
-                return content;
+                return deduplicateContent(content);
             }
         }
         
@@ -167,20 +167,20 @@ public class ChatController {
                     if (className.contains("AssistantMessage") || className.contains("AIMessage")) {
                         String content = extractContentFromObject(item);
                         if (content != null && !content.isBlank()) {
-                            return content;
+                            return deduplicateContent(content);
                         }
                     }
                     if (className.contains("GraphResponse")) {
                         String content = extractContentFromObject(item);
                         if (content != null && !content.isBlank()) {
-                            return content;
+                            return deduplicateContent(content);
                         }
                     }
                 }
             }
             String content = extractContentFromObject(messages);
             if (content != null && !content.isBlank()) {
-                return content;
+                return deduplicateContent(content);
             }
         }
 
@@ -189,7 +189,7 @@ public class ChatController {
             if (val != null) {
                 String content = extractContentFromObject(val);
                 if (content != null && !content.isBlank()) {
-                    return content;
+                    return deduplicateContent(content);
                 }
             }
         }
@@ -200,12 +200,34 @@ public class ChatController {
                 if (entry.getValue() != null && !entry.getKey().startsWith("_")) {
                     String content = extractContentFromObject(entry.getValue());
                     if (content != null && !content.isBlank()) {
-                        return content;
+                        return deduplicateContent(content);
                     }
                 }
             }
         }
         return "处理完成，但未获取到具体回复内容。";
+    }
+
+    private String deduplicateContent(String content) {
+        if (content == null || content.length() < 100) {
+            return content;
+        }
+        int halfLength = content.length() / 2;
+        String firstHalf = content.substring(0, halfLength);
+        String secondHalf = content.substring(halfLength);
+        if (firstHalf.equals(secondHalf)) {
+            log.debug("Detected duplicated content, returning first half");
+            return firstHalf;
+        }
+        for (int len = halfLength; len >= 50; len--) {
+            String prefix = content.substring(0, len);
+            String suffix = content.substring(content.length() - len);
+            if (prefix.equals(suffix)) {
+                log.debug("Detected duplicated content with length {}, returning deduplicated", len);
+                return content.substring(0, content.length() - len);
+            }
+        }
+        return content;
     }
 
     private String extractContentFromObject(Object obj) {
@@ -247,38 +269,31 @@ public class ChatController {
             }
             if (className.contains("GraphResponse")) {
                 try {
-                    java.lang.reflect.Method outputMethod = obj.getClass().getMethod("output");
-                    Object output = outputMethod.invoke(obj);
-                    if (output != null) {
-                        String content = extractContentFromObject(output);
+                    java.lang.reflect.Method getOutputMethod = obj.getClass().getMethod("getOutput");
+                    Object outputObj = getOutputMethod.invoke(obj);
+                    if (outputObj instanceof java.util.concurrent.CompletableFuture<?> future) {
+                        Object result = future.get(30, java.util.concurrent.TimeUnit.SECONDS);
+                        if (result != null) {
+                            String content = extractContentFromObject(result);
+                            if (content != null && !content.isBlank()) {
+                                return content;
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    log.debug("Failed to extract from GraphResponse via getOutput: {}", e.getMessage());
+                }
+                try {
+                    java.lang.reflect.Method resultValueMethod = obj.getClass().getMethod("resultValue");
+                    Object resultOpt = resultValueMethod.invoke(obj);
+                    if (resultOpt instanceof java.util.Optional<?> opt && opt.isPresent()) {
+                        String content = extractContentFromObject(opt.get());
                         if (content != null && !content.isBlank()) {
                             return content;
                         }
                     }
                 } catch (Exception e) {
-                    log.debug("Failed to extract from GraphResponse via output: {}", e.getMessage());
-                }
-                try {
-                    java.lang.reflect.Field stateField = obj.getClass().getDeclaredField("state");
-                    stateField.setAccessible(true);
-                    Object stateObj = stateField.get(obj);
-                    if (stateObj != null) {
-                        String content = extractContentFromObject(stateObj);
-                        if (content != null && !content.isBlank()) {
-                            return content;
-                        }
-                    }
-                } catch (Exception e) {
-                    log.debug("Failed to extract from GraphResponse via state: {}", e.getMessage());
-                }
-                try {
-                    java.lang.reflect.Method toStringMethod = obj.getClass().getMethod("toString");
-                    String str = (String) toStringMethod.invoke(obj);
-                    if (str != null && !str.startsWith("com.alibaba.cloud.ai.graph.GraphResponse@")) {
-                        return str;
-                    }
-                } catch (Exception e) {
-                    log.debug("Failed to extract from GraphResponse via toString: {}", e.getMessage());
+                    log.debug("Failed to extract from GraphResponse via resultValue: {}", e.getMessage());
                 }
             }
             if (obj instanceof String) {
