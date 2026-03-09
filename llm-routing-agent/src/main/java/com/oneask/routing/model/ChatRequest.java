@@ -3,6 +3,7 @@ package com.oneask.routing.model;
 public class ChatRequest {
 
     private String message;
+    private String query;
     private String sessionId;
 
     public ChatRequest() {
@@ -19,6 +20,14 @@ public class ChatRequest {
 
     public void setMessage(String message) {
         this.message = message;
+    }
+
+    public String getQuery() {
+        return query;
+    }
+
+    public void setQuery(String query) {
+        this.query = query;
     }
 
     public String getSessionId() {

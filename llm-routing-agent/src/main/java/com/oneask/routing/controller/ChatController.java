@@ -1,7 +1,8 @@
 package com.oneask.routing.controller;
 
 import com.alibaba.cloud.ai.graph.OverAllState;
-import com.alibaba.cloud.ai.graph.agent.flow.agent.LlmRoutingAgent;
+import com.alibaba.cloud.ai.graph.agent.ReactAgent;
+import com.alibaba.cloud.ai.graph.agent.a2a.A2aRemoteAgent;
 import com.oneask.routing.model.ChatRequest;
 import com.oneask.routing.model.ChatResponse;
 import org.slf4j.Logger;
@@ -20,14 +21,26 @@ public class ChatController {
 
     private static final Logger log = LoggerFactory.getLogger(ChatController.class);
 
-    private final LlmRoutingAgent llmRoutingAgent;
+    private final ReactAgent routingAgent;
+    private final ReactAgent defaultAgent;
+    private final A2aRemoteAgent customerServiceAgent;
 
-    // 简单的短期记忆存储：sessionId -> 对话历史
     private final Map<String, List<Map<String, String>>> chatMemory = new ConcurrentHashMap<>();
     private static final int MAX_MEMORY_SIZE = 20;
 
-    public ChatController(@Qualifier("llmRoutingAgent") LlmRoutingAgent llmRoutingAgent) {
-        this.llmRoutingAgent = llmRoutingAgent;
+    private static final Set<String> CUSTOMER_SERVICE_KEYWORDS = Set.of(
+            "经纬度", "坐标", "地址", "位置", "在哪里", "查询", "地图",
+            "客服", "订单", "售后", "投诉", "建议", "退款", "物流",
+            "天安门", "外滩", "西湖", "广场", "街道", "路", "号"
+    );
+
+    public ChatController(
+            @Qualifier("routingAgent") ReactAgent routingAgent,
+            @Qualifier("defaultAgent") ReactAgent defaultAgent,
+            @Qualifier("customerServiceRemoteAgent") A2aRemoteAgent customerServiceAgent) {
+        this.routingAgent = routingAgent;
+        this.defaultAgent = defaultAgent;
+        this.customerServiceAgent = customerServiceAgent;
     }
 
     @PostMapping(value = "/chat", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -37,27 +50,38 @@ public class ChatController {
             sessionId = UUID.randomUUID().toString();
         }
         String message = request.getMessage();
+        
+        if (message == null || message.isBlank()) {
+            message = request.getQuery();
+        }
 
         log.info("Received chat request [session={}]: {}", sessionId, message);
 
-        // 记录用户消息到短期记忆
         addToMemory(sessionId, "user", message);
 
         try {
-            // 构建包含上下文的提示
             String contextualPrompt = buildContextualPrompt(sessionId, message);
+            
+            String targetAgent = determineTargetAgent(message);
+            log.info("Routing to agent: {}", targetAgent);
 
-            // 调用 LlmRoutingAgent
-            Optional<OverAllState> result = llmRoutingAgent.invoke(contextualPrompt);
+            Optional<OverAllState> result;
+            String routedTo;
+
+            if ("customer_service_agent".equals(targetAgent)) {
+                result = customerServiceAgent.invoke(message);
+                routedTo = "customer_service_agent";
+            } else {
+                result = defaultAgent.invoke(contextualPrompt);
+                routedTo = "default_agent";
+            }
 
             if (result.isPresent()) {
                 OverAllState state = result.get();
                 String reply = extractReply(state);
-                String routedTo = extractRoutedAgent(state);
 
-                log.info("Agent routed to: {}, reply length: {}", routedTo, reply.length());
+                log.info("Agent {} returned reply length: {}", routedTo, reply.length());
 
-                // 记录 AI 回复到短期记忆
                 addToMemory(sessionId, "assistant", reply);
 
                 ChatResponse response = new ChatResponse(
@@ -68,7 +92,7 @@ public class ChatController {
                 );
                 return ResponseEntity.ok(response);
             } else {
-                log.warn("LlmRoutingAgent returned empty result");
+                log.warn("Agent {} returned empty result", routedTo);
                 ChatResponse response = new ChatResponse(
                         sessionId,
                         "抱歉，系统暂时无法处理您的请求，请稍后再试。",
@@ -106,6 +130,21 @@ public class ChatController {
         return ResponseEntity.ok(result);
     }
 
+    private String determineTargetAgent(String message) {
+        if (message == null || message.isBlank()) {
+            return "default_agent";
+        }
+        
+        String lowerMessage = message.toLowerCase();
+        for (String keyword : CUSTOMER_SERVICE_KEYWORDS) {
+            if (lowerMessage.contains(keyword)) {
+                return "customer_service_agent";
+            }
+        }
+        
+        return "default_agent";
+    }
+
     private String buildContextualPrompt(String sessionId, String currentMessage) {
         List<Map<String, String>> history = chatMemory.get(sessionId);
         if (history == null || history.size() <= 1) {
@@ -115,7 +154,6 @@ public class ChatController {
         StringBuilder sb = new StringBuilder();
         sb.append("以下是用户的对话历史（仅供参考上下文）：\n");
 
-        // 只取最近的历史记录（排除最新一条，因为就是当前消息）
         int start = Math.max(0, history.size() - MAX_MEMORY_SIZE - 1);
         for (int i = start; i < history.size() - 1; i++) {
             Map<String, String> entry = history.get(i);
@@ -136,7 +174,6 @@ public class ChatController {
         entry.put("content", content);
         history.add(entry);
 
-        // 保持记忆不超过限制
         while (history.size() > MAX_MEMORY_SIZE * 2) {
             history.remove(0);
         }
@@ -145,62 +182,44 @@ public class ChatController {
     private String extractReply(OverAllState state) {
         log.debug("Extracting reply from state, keys: {}", state.data().keySet());
         
+        // 优先从 messages 列表中获取最后一个助手消息
+        Object messages = state.value("messages").orElse(null);
+        if (messages != null) {
+            String content = extractLastAssistantMessage(messages);
+            if (content != null && !content.isBlank()) {
+                log.debug("Extracted content from messages: {}", content.length() > 200 ? content.substring(0, 200) + "..." : content);
+                return content;
+            }
+        }
+        
+        // 尝试从 output 获取
         Object output = state.value("output").orElse(null);
-        log.debug("output object: {}, type: {}", output, output != null ? output.getClass().getName() : "null");
         if (output != null) {
             String content = extractContentFromObject(output);
             if (content != null && !content.isBlank()) {
-                return deduplicateContent(content);
-            }
-        }
-        
-        Object messages = state.value("messages").orElse(null);
-        log.debug("messages object: {}, type: {}", messages, messages != null ? messages.getClass().getName() : "null");
-        
-        if (messages != null) {
-            if (messages instanceof List<?> list && !list.isEmpty()) {
-                log.debug("messages list size: {}", list.size());
-                for (int i = list.size() - 1; i >= 0; i--) {
-                    Object item = list.get(i);
-                    String className = item.getClass().getName();
-                    log.debug("Item {}: type={}", i, className);
-                    if (className.contains("AssistantMessage") || className.contains("AIMessage")) {
-                        String content = extractContentFromObject(item);
-                        if (content != null && !content.isBlank()) {
-                            return deduplicateContent(content);
-                        }
-                    }
-                    if (className.contains("GraphResponse")) {
-                        String content = extractContentFromObject(item);
-                        if (content != null && !content.isBlank()) {
-                            return deduplicateContent(content);
-                        }
-                    }
-                }
-            }
-            String content = extractContentFromObject(messages);
-            if (content != null && !content.isBlank()) {
-                return deduplicateContent(content);
+                return content;
             }
         }
 
-        for (String key : List.of("result", "response", "writer_output", "reviewer_output")) {
+        // 尝试其他字段
+        for (String key : List.of("result", "response")) {
             Object val = state.value(key).orElse(null);
             if (val != null) {
                 String content = extractContentFromObject(val);
                 if (content != null && !content.isBlank()) {
-                    return deduplicateContent(content);
+                    return content;
                 }
             }
         }
 
+        // 遍历所有数据
         Map<String, Object> allData = state.data();
         if (allData != null && !allData.isEmpty()) {
             for (Map.Entry<String, Object> entry : allData.entrySet()) {
                 if (entry.getValue() != null && !entry.getKey().startsWith("_")) {
                     String content = extractContentFromObject(entry.getValue());
                     if (content != null && !content.isBlank()) {
-                        return deduplicateContent(content);
+                        return content;
                     }
                 }
             }
@@ -208,26 +227,33 @@ public class ChatController {
         return "处理完成，但未获取到具体回复内容。";
     }
 
-    private String deduplicateContent(String content) {
-        if (content == null || content.length() < 100) {
-            return content;
-        }
-        int halfLength = content.length() / 2;
-        String firstHalf = content.substring(0, halfLength);
-        String secondHalf = content.substring(halfLength);
-        if (firstHalf.equals(secondHalf)) {
-            log.debug("Detected duplicated content, returning first half");
-            return firstHalf;
-        }
-        for (int len = halfLength; len >= 50; len--) {
-            String prefix = content.substring(0, len);
-            String suffix = content.substring(content.length() - len);
-            if (prefix.equals(suffix)) {
-                log.debug("Detected duplicated content with length {}, returning deduplicated", len);
-                return content.substring(0, content.length() - len);
+    /**
+     * 从消息列表中提取最后一个助手消息的内容
+     */
+    private String extractLastAssistantMessage(Object messages) {
+        if (messages instanceof List<?> list && !list.isEmpty()) {
+            log.debug("Messages list size: {}", list.size());
+            
+            // 从后向前遍历，找到最后一个助手消息
+            for (int i = list.size() - 1; i >= 0; i--) {
+                Object item = list.get(i);
+                String itemClassName = item.getClass().getName();
+                log.debug("Processing message item {} type: {}", i, itemClassName);
+                
+                // 只处理助手消息
+                if (itemClassName.contains("AssistantMessage") || itemClassName.contains("AIMessage")) {
+                    String content = extractContentFromObject(item);
+                    if (content != null && !content.isBlank()) {
+                        // 过滤掉简单的 "pong" 响应
+                        if (!content.trim().equalsIgnoreCase("pong") && !content.trim().equalsIgnoreCase(" pong")) {
+                            log.debug("Found valid assistant message at index {}: {}", i, content.length() > 200 ? content.substring(0, 200) + "..." : content);
+                            return content;
+                        }
+                    }
+                }
             }
         }
-        return content;
+        return null;
     }
 
     private String extractContentFromObject(Object obj) {
@@ -236,6 +262,7 @@ public class ChatController {
         }
         try {
             String className = obj.getClass().getName();
+            
             if (className.contains("AssistantMessage") || className.contains("AIMessage")) {
                 try {
                     java.lang.reflect.Method getTextContentMethod = obj.getClass().getMethod("getTextContent");
@@ -264,56 +291,25 @@ public class ChatController {
                 }
                 return str;
             }
+            
             if (className.contains("UserMessage")) {
                 return null;
             }
-            if (className.contains("GraphResponse")) {
-                try {
-                    java.lang.reflect.Method getOutputMethod = obj.getClass().getMethod("getOutput");
-                    Object outputObj = getOutputMethod.invoke(obj);
-                    if (outputObj instanceof java.util.concurrent.CompletableFuture<?> future) {
-                        Object result = future.get(30, java.util.concurrent.TimeUnit.SECONDS);
-                        if (result != null) {
-                            String content = extractContentFromObject(result);
-                            if (content != null && !content.isBlank()) {
-                                return content;
-                            }
-                        }
-                    }
-                } catch (Exception e) {
-                    log.debug("Failed to extract from GraphResponse via getOutput: {}", e.getMessage());
-                }
-                try {
-                    java.lang.reflect.Method resultValueMethod = obj.getClass().getMethod("resultValue");
-                    Object resultOpt = resultValueMethod.invoke(obj);
-                    if (resultOpt instanceof java.util.Optional<?> opt && opt.isPresent()) {
-                        String content = extractContentFromObject(opt.get());
-                        if (content != null && !content.isBlank()) {
-                            return content;
-                        }
-                    }
-                } catch (Exception e) {
-                    log.debug("Failed to extract from GraphResponse via resultValue: {}", e.getMessage());
-                }
-            }
+            
             if (obj instanceof String) {
                 return (String) obj;
             }
+            
+            if (obj instanceof Map) {
+                Map<?, ?> map = (Map<?, ?>) obj;
+                Object outputVal = map.get("output");
+                if (outputVal != null) {
+                    return extractContentFromObject(outputVal);
+                }
+            }
         } catch (Exception e) {
-            log.debug("Failed to extract content from object: {}", e.getMessage());
+            log.debug("Failed to extract content: {}", e.getMessage());
         }
-        return obj.toString();
-    }
-
-    private String extractRoutedAgent(OverAllState state) {
-        Object routedTo = state.value("_routed_to").orElse(null);
-        if (routedTo != null) {
-            return routedTo.toString();
-        }
-        // 检查是否有子 agent 输出 key 来推断路由目标
-        if (state.value("messages").isPresent()) {
-            return "customer_service_agent";
-        }
-        return "default_agent";
+        return null;
     }
 }

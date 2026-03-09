@@ -1,18 +1,14 @@
 package com.oneask.routing.config;
 
+import com.alibaba.cloud.ai.graph.OverAllState;
 import com.alibaba.cloud.ai.graph.agent.ReactAgent;
 import com.alibaba.cloud.ai.graph.agent.a2a.A2aRemoteAgent;
 import com.alibaba.cloud.ai.graph.agent.a2a.AgentCardProvider;
-import com.alibaba.cloud.ai.graph.agent.flow.agent.LlmRoutingAgent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.model.ChatModel;
-import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
-import org.springframework.context.annotation.Primary;
-
-import java.util.List;
 
 @Configuration
 public class AgentConfig {
@@ -20,12 +16,7 @@ public class AgentConfig {
         private static final Logger log = LoggerFactory.getLogger(AgentConfig.class);
 
         private static final String ROUTING_SYSTEM_PROMPT = """
-                        你是一个智能的问答路由Agent，负责根据用户需求将任务路由到最合适的专家Agent。
-
-                        ## 你的职责
-                        1. 仔细分析用户输入的意图和需求
-                        2. 根据任务特性，选择最合适的专家Agent
-                        3. 确保路由决策准确、高效
+                        你是一个智能的问答路由Agent。你需要分析用户输入，判断应该路由到哪个Agent。
 
                         ## 可用的子Agent及其职责
 
@@ -46,13 +37,12 @@ public class AgentConfig {
                           * 不属于客服范畴的其他问题
 
                         ## 决策规则
-                        1. **客服任务**: 如果用户问题涉及客服、订单、售后、地址查询等，选择 customer_service_agent
+                        1. **客服任务**: 如果用户问题涉及客服、订单、售后、地址查询、经纬度、位置等，选择 customer_service_agent
                         2. **通用任务**: 其他所有问题，选择 default_agent
+
+                        请直接回答用户的问题，如果问题涉及地址查询、经纬度查询，请明确告知用户相关信息。
                         """;
 
-        /**
-         * 远程客服 Agent（通过 Nacos 发现）
-         */
         @Bean(name = "customerServiceRemoteAgent")
         public A2aRemoteAgent customerServiceRemoteAgent(AgentCardProvider agentCardProvider) {
                 log.info("Creating A2A Remote Agent for customer_service_agent via Nacos discovery...");
@@ -63,9 +53,6 @@ public class AgentConfig {
                                 .build();
         }
 
-        /**
-         * 本地默认 Agent（Fallback）
-         */
         @Bean(name = "defaultAgent")
         public ReactAgent defaultAgent(ChatModel chatModel) {
                 return ReactAgent.builder()
@@ -78,23 +65,15 @@ public class AgentConfig {
                                 .build();
         }
 
-        /**
-         * LLM 智能路由 Agent
-         */
-        @Bean(name = "llmRoutingAgent")
-        @Primary
-        public LlmRoutingAgent llmRoutingAgent(
-                        ChatModel chatModel,
-                        A2aRemoteAgent customerServiceRemoteAgent,
-                        ReactAgent defaultAgent) {
-
-                log.info("Creating LlmRoutingAgent with sub-agents: customer_service_agent, default_agent");
-                return LlmRoutingAgent.builder()
-                                .name("llm_routing_agent")
-                                .description("智能路由Agent，根据用户输入内容动态选择合适的专家Agent处理")
+        @Bean(name = "routingAgent")
+        public ReactAgent routingAgent(ChatModel chatModel) {
+                log.info("Creating Routing ReactAgent...");
+                return ReactAgent.builder()
+                                .name("routing_agent")
                                 .model(chatModel)
-                                .systemPrompt(ROUTING_SYSTEM_PROMPT)
-                                .subAgents(List.of(customerServiceRemoteAgent, defaultAgent))
+                                .description("智能路由Agent，根据用户输入内容动态选择合适的专家Agent处理")
+                                .instruction(ROUTING_SYSTEM_PROMPT)
+                                .outputKey("messages")
                                 .build();
         }
 }

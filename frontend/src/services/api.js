@@ -28,10 +28,13 @@ export const streamChat = (message, sessionId, onMessage, onComplete, onError) =
         }
 
         const contentType = response.headers.get('content-type');
+        console.log('Response content-type:', contentType);
         
         if (contentType && contentType.includes('application/json')) {
             const data = await response.json();
+            console.log('Response data:', data);
             if (data.reply) {
+                console.log('Calling onMessage with reply:', data.reply.substring(0, 100));
                 onMessage(data.reply);
             }
             if (data.routedTo) {

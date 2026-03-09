@@ -9,7 +9,7 @@ spring:
       api-key: ${AI_DASHSCOPE_API_KEY:}
       chat:
         options:
-          model: deepseek-v3.2
+          model: qwen-plus
     alibaba:
       a2a:
         nacos:
@@ -33,10 +33,15 @@ spring:
 app:
   baidu:
     map-ak: ${BAIDU_MAP_AK:}
-  python:
-    path: ${PYTHON_PATH:python3}
 
 logging:
   level:
+    root: INFO
     com.oneask: DEBUG
+    com.oneask.customer: TRACE
     com.alibaba.cloud.ai: DEBUG
+    com.alibaba.cloud.ai.graph: TRACE
+    com.alibaba.cloud.ai.graph.agent: TRACE
+    org.springframework.ai: DEBUG
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] [%X{traceId}] %-5level %logger{36} - %msg%n"
