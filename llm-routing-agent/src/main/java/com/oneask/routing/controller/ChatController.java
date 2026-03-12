@@ -20,6 +20,8 @@ import org.springframework.web.client.RestTemplate;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
+import org.slf4j.MDC;
+
 @RestController
 @RequestMapping("/api")
 public class ChatController {
@@ -68,46 +70,59 @@ public class ChatController {
 
     public ChatController(
             @Qualifier("defaultAgent") ReactAgent defaultAgent,
-            ChatModel chatModel) {
+            ChatModel chatModel,
+            @Qualifier("loadBalancedRestTemplate") RestTemplate loadBalancedRestTemplate) {
         this.defaultAgent = defaultAgent;
         this.chatModel = chatModel;
         this.objectMapper = new ObjectMapper();
-        
-        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
-        factory.setConnectTimeout(30000);
-        factory.setReadTimeout(120000);
-        this.restTemplate = new RestTemplate(factory);
+        this.restTemplate = loadBalancedRestTemplate;
+        log.info("ChatController initialized with LoadBalanced RestTemplate for Nacos service discovery");
     }
 
     @PostMapping(value = "/chat", produces = MediaType.APPLICATION_JSON_VALUE)
     public ResponseEntity<ChatResponse> chat(@RequestBody ChatRequest request) {
+        String traceId = UUID.randomUUID().toString().substring(0, 8);
+        MDC.put("traceId", traceId);
+        long startTime = System.currentTimeMillis();
+
         String sessionId = request.getSessionId();
         if (sessionId == null || sessionId.isBlank()) {
             sessionId = UUID.randomUUID().toString();
         }
         String message = request.getMessage();
-        
+
         if (message == null || message.isBlank()) {
             message = request.getQuery();
         }
 
-        log.info("Received chat request [session={}]: {}", sessionId, message);
+        log.info("[CALL-CHAIN] ========== 请求开始 ==========");
+        log.info("[CALL-CHAIN] TraceId: {}, SessionId: {}", traceId, sessionId);
+        log.info("[CALL-CHAIN] 用户输入: {}", message);
+        log.info("[CALL-CHAIN] 步骤1: 接收请求 - 耗时: 0ms");
 
         addToMemory(sessionId, "user", message);
 
         try {
+            long step2Start = System.currentTimeMillis();
             String contextualPrompt = buildContextualPrompt(sessionId, message);
-            
+
+            log.info("[CALL-CHAIN] 步骤2: 构建上下文提示 - 耗时: {}ms", System.currentTimeMillis() - step2Start);
+
+            long step3Start = System.currentTimeMillis();
             String targetAgent = determineTargetAgentByLLM(message);
-            log.info("LLM routing decision: {}", targetAgent);
+            long routingTime = System.currentTimeMillis() - step3Start;
+            log.info("[CALL-CHAIN] 步骤3: LLM路由决策 - 目标Agent: {} - 耗时: {}ms", targetAgent, routingTime);
 
             String reply;
             String routedTo;
+            long step4Start = System.currentTimeMillis();
 
             if ("customer_service_agent".equals(targetAgent)) {
-                reply = callCustomerServiceAgent(message);
+                log.info("[CALL-CHAIN] 步骤4: 调用Customer Service Agent - 开始");
+                reply = callCustomerServiceAgent(message, traceId);
                 routedTo = "customer_service_agent";
             } else {
+                log.info("[CALL-CHAIN] 步骤4: 调用Default Agent - 开始");
                 Optional<OverAllState> result = defaultAgent.invoke(contextualPrompt);
                 if (result.isPresent()) {
                     reply = extractReply(result.get());
@@ -116,10 +131,14 @@ public class ChatController {
                 }
                 routedTo = "default_agent";
             }
-
-            log.info("Agent {} returned reply length: {}", routedTo, reply.length());
+            long agentTime = System.currentTimeMillis() - step4Start;
+            log.info("[CALL-CHAIN] 步骤4: Agent执行完成 - Agent: {} - 响应长度: {} - 耗时: {}ms", routedTo, reply.length(), agentTime);
 
             addToMemory(sessionId, "assistant", reply);
+
+            long totalTime = System.currentTimeMillis() - startTime;
+            log.info("[CALL-CHAIN] 步骤5: 构建响应 - 总耗时: {}ms", totalTime);
+            log.info("[CALL-CHAIN] ========== 请求完成 ==========");
 
             ChatResponse response = new ChatResponse(
                     sessionId,
@@ -129,7 +148,7 @@ public class ChatController {
             );
             return ResponseEntity.ok(response);
         } catch (Exception e) {
-            log.error("Error processing chat request", e);
+            log.error("[CALL-CHAIN] 请求处理异常: {}", e.getMessage(), e);
             ChatResponse response = new ChatResponse(
                     sessionId,
                     "系统处理出错：" + e.getMessage(),
@@ -137,6 +156,8 @@ public class ChatController {
                     false
             );
             return ResponseEntity.internalServerError().body(response);
+        } finally {
+            MDC.remove("traceId");
         }
     }
 
@@ -159,33 +180,49 @@ public class ChatController {
 
     /**
      * 调用 Customer Service Agent
+     * 使用 Nacos 服务发现，通过服务名调用
      */
-    private String callCustomerServiceAgent(String message) {
+    private String callCustomerServiceAgent(String message, String traceId) {
+        long callStart = System.currentTimeMillis();
         try {
-            String url = customerServiceUrl + "/api/agent/chat";
-            
+            // 使用 Nacos 服务名调用，格式: http://service-name/path
+            String serviceName = "customer-service-agent";
+            String url = "http://" + serviceName + "/api/agent/chat";
+
             Map<String, String> requestBody = new HashMap<>();
             requestBody.put("message", message);
-            
+            requestBody.put("traceId", traceId);
+
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_JSON);
-            
+
             HttpEntity<Map<String, String>> entity = new HttpEntity<>(requestBody, headers);
-            
-            log.debug("Calling Customer Service Agent: {}", url);
+
+            log.info("[CALL-CHAIN]   --> 发送HTTP请求到Customer Service Agent (通过Nacos服务发现)");
+            log.info("[CALL-CHAIN]   --> 服务名: {}", serviceName);
+            log.info("[CALL-CHAIN]   --> URL: {}", url);
+            log.info("[CALL-CHAIN]   --> TraceId: {}", traceId);
+
             ResponseEntity<Map> response = restTemplate.exchange(url, HttpMethod.POST, entity, Map.class);
-            
+
+            long callTime = System.currentTimeMillis() - callStart;
+            log.info("[CALL-CHAIN]   <-- 收到Customer Service Agent响应 - 耗时: {}ms", callTime);
+
             if (response.getStatusCode() == HttpStatus.OK && response.getBody() != null) {
                 Map<String, Object> body = response.getBody();
                 Object responseContent = body.get("response");
                 if (responseContent != null) {
-                    return responseContent.toString();
+                    String content = responseContent.toString();
+                    log.info("[CALL-CHAIN]   <-- 响应内容长度: {}", content.length());
+                    return content;
                 }
             }
-            
+
+            log.warn("[CALL-CHAIN]   <-- Customer Service Agent返回异常状态: {}", response.getStatusCode());
             return "客服服务暂时不可用，请稍后再试。";
         } catch (Exception e) {
-            log.error("Failed to call Customer Service Agent", e);
+            long callTime = System.currentTimeMillis() - callStart;
+            log.error("[CALL-CHAIN]   <-- 调用Customer Service Agent失败 - 耗时: {}ms - 错误: {}", callTime, e.getMessage());
             return "调用客服服务失败：" + e.getMessage();
         }
     }

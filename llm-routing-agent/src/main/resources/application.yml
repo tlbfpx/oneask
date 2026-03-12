@@ -4,6 +4,9 @@ server:
 spring:
   application:
     name: llm-routing-agent
+  cloud:
+    compatibility-verifier:
+      enabled: false
   ai:
     dashscope:
       api-key: ${AI_DASHSCOPE_API_KEY:}
@@ -17,7 +20,7 @@ spring:
           username: ${NACOS_USERNAME:nacos}
           password: ${NACOS_PASSWORD:}
           discovery:
-            enabled: false
+            enabled: true
           registry:
             enabled: false
         server:
