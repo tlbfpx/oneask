@@ -2,15 +2,20 @@ package com.oneask.routing.controller;
 
 import com.alibaba.cloud.ai.graph.OverAllState;
 import com.alibaba.cloud.ai.graph.agent.ReactAgent;
-import com.alibaba.cloud.ai.graph.agent.a2a.A2aRemoteAgent;
 import com.oneask.routing.model.ChatRequest;
 import com.oneask.routing.model.ChatResponse;
+import com.oneask.routing.model.RoutingDecision;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.beans.factory.annotation.Qualifier;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.*;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.web.client.RestTemplate;
 
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -21,26 +26,57 @@ public class ChatController {
 
     private static final Logger log = LoggerFactory.getLogger(ChatController.class);
 
-    private final ReactAgent routingAgent;
     private final ReactAgent defaultAgent;
-    private final A2aRemoteAgent customerServiceAgent;
+    private final ChatModel chatModel;
+    private final ObjectMapper objectMapper;
+    private final RestTemplate restTemplate;
 
     private final Map<String, List<Map<String, String>>> chatMemory = new ConcurrentHashMap<>();
     private static final int MAX_MEMORY_SIZE = 20;
 
-    private static final Set<String> CUSTOMER_SERVICE_KEYWORDS = Set.of(
-            "经纬度", "坐标", "地址", "位置", "在哪里", "查询", "地图",
-            "客服", "订单", "售后", "投诉", "建议", "退款", "物流",
-            "天安门", "外滩", "西湖", "广场", "街道", "路", "号"
-    );
+    @Value("${customer-service.url:http://localhost:8081}")
+    private String customerServiceUrl;
+
+    private static final String ROUTING_PROMPT = """
+            你是一个智能路由决策器。分析用户的问题，决定应该路由到哪个Agent处理。
+            
+            ## 可用的Agent
+            
+            1. **customer_service_agent** - 专业客服Agent
+               - 处理客户咨询、售后服务
+               - 地址查询、经纬度查询、位置相关
+               - 订单问题、投诉建议、退款物流
+            
+            2. **default_agent** - 通用助手Agent
+               - 闲聊、打招呼
+               - 通用知识问答
+               - 其他不属于客服范畴的问题
+            
+            ## 输出格式
+            
+            请严格按照以下JSON格式输出，不要输出其他内容：
+            ```json
+            {
+                "agent": "customer_service_agent 或 default_agent",
+                "reason": "选择该Agent的简短理由"
+            }
+            ```
+            
+            ## 用户问题
+            %s
+            """;
 
     public ChatController(
-            @Qualifier("routingAgent") ReactAgent routingAgent,
             @Qualifier("defaultAgent") ReactAgent defaultAgent,
-            @Qualifier("customerServiceRemoteAgent") A2aRemoteAgent customerServiceAgent) {
-        this.routingAgent = routingAgent;
+            ChatModel chatModel) {
         this.defaultAgent = defaultAgent;
-        this.customerServiceAgent = customerServiceAgent;
+        this.chatModel = chatModel;
+        this.objectMapper = new ObjectMapper();
+        
+        SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(30000);
+        factory.setReadTimeout(120000);
+        this.restTemplate = new RestTemplate(factory);
     }
 
     @PostMapping(value = "/chat", produces = MediaType.APPLICATION_JSON_VALUE)
@@ -62,45 +98,36 @@ public class ChatController {
         try {
             String contextualPrompt = buildContextualPrompt(sessionId, message);
             
-            String targetAgent = determineTargetAgent(message);
-            log.info("Routing to agent: {}", targetAgent);
+            String targetAgent = determineTargetAgentByLLM(message);
+            log.info("LLM routing decision: {}", targetAgent);
 
-            Optional<OverAllState> result;
+            String reply;
             String routedTo;
 
             if ("customer_service_agent".equals(targetAgent)) {
-                result = customerServiceAgent.invoke(message);
+                reply = callCustomerServiceAgent(message);
                 routedTo = "customer_service_agent";
             } else {
-                result = defaultAgent.invoke(contextualPrompt);
+                Optional<OverAllState> result = defaultAgent.invoke(contextualPrompt);
+                if (result.isPresent()) {
+                    reply = extractReply(result.get());
+                } else {
+                    reply = "抱歉，系统暂时无法处理您的请求，请稍后再试。";
+                }
                 routedTo = "default_agent";
             }
 
-            if (result.isPresent()) {
-                OverAllState state = result.get();
-                String reply = extractReply(state);
+            log.info("Agent {} returned reply length: {}", routedTo, reply.length());
 
-                log.info("Agent {} returned reply length: {}", routedTo, reply.length());
+            addToMemory(sessionId, "assistant", reply);
 
-                addToMemory(sessionId, "assistant", reply);
-
-                ChatResponse response = new ChatResponse(
-                        sessionId,
-                        reply,
-                        routedTo,
-                        true
-                );
-                return ResponseEntity.ok(response);
-            } else {
-                log.warn("Agent {} returned empty result", routedTo);
-                ChatResponse response = new ChatResponse(
-                        sessionId,
-                        "抱歉，系统暂时无法处理您的请求，请稍后再试。",
-                        "none",
-                        false
-                );
-                return ResponseEntity.ok(response);
-            }
+            ChatResponse response = new ChatResponse(
+                    sessionId,
+                    reply,
+                    routedTo,
+                    true
+            );
+            return ResponseEntity.ok(response);
         } catch (Exception e) {
             log.error("Error processing chat request", e);
             ChatResponse response = new ChatResponse(
@@ -130,19 +157,83 @@ public class ChatController {
         return ResponseEntity.ok(result);
     }
 
-    private String determineTargetAgent(String message) {
-        if (message == null || message.isBlank()) {
-            return "default_agent";
-        }
-        
-        String lowerMessage = message.toLowerCase();
-        for (String keyword : CUSTOMER_SERVICE_KEYWORDS) {
-            if (lowerMessage.contains(keyword)) {
-                return "customer_service_agent";
+    /**
+     * 调用 Customer Service Agent
+     */
+    private String callCustomerServiceAgent(String message) {
+        try {
+            String url = customerServiceUrl + "/api/agent/chat";
+            
+            Map<String, String> requestBody = new HashMap<>();
+            requestBody.put("message", message);
+            
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            
+            HttpEntity<Map<String, String>> entity = new HttpEntity<>(requestBody, headers);
+            
+            log.debug("Calling Customer Service Agent: {}", url);
+            ResponseEntity<Map> response = restTemplate.exchange(url, HttpMethod.POST, entity, Map.class);
+            
+            if (response.getStatusCode() == HttpStatus.OK && response.getBody() != null) {
+                Map<String, Object> body = response.getBody();
+                Object responseContent = body.get("response");
+                if (responseContent != null) {
+                    return responseContent.toString();
+                }
             }
+            
+            return "客服服务暂时不可用，请稍后再试。";
+        } catch (Exception e) {
+            log.error("Failed to call Customer Service Agent", e);
+            return "调用客服服务失败：" + e.getMessage();
+        }
+    }
+
+    /**
+     * 使用 LLM 智能判断路由目标
+     */
+    private String determineTargetAgentByLLM(String message) {
+        try {
+            String promptText = String.format(ROUTING_PROMPT, message);
+            Prompt prompt = new Prompt(promptText);
+            Object output = chatModel.call(prompt).getResult().getOutput();
+            
+            String response = extractContentFromObject(output);
+            log.debug("LLM routing response: {}", response);
+            
+            String jsonContent = extractJsonFromResponse(response);
+            if (jsonContent != null) {
+                RoutingDecision decision = objectMapper.readValue(jsonContent, RoutingDecision.class);
+                log.info("Routing decision - Agent: {}, Reason: {}", decision.getAgent(), decision.getReason());
+                
+                if ("customer_service_agent".equals(decision.getAgent()) || "default_agent".equals(decision.getAgent())) {
+                    return decision.getAgent();
+                }
+            }
+        } catch (Exception e) {
+            log.warn("LLM routing failed, fallback to default agent: {}", e.getMessage());
         }
         
         return "default_agent";
+    }
+
+    /**
+     * 从响应中提取 JSON 内容
+     */
+    private String extractJsonFromResponse(String response) {
+        if (response == null || response.isBlank()) {
+            return null;
+        }
+        
+        int start = response.indexOf('{');
+        int end = response.lastIndexOf('}');
+        
+        if (start >= 0 && end > start) {
+            return response.substring(start, end + 1);
+        }
+        
+        return null;
     }
 
     private String buildContextualPrompt(String sessionId, String currentMessage) {
@@ -182,7 +273,6 @@ public class ChatController {
     private String extractReply(OverAllState state) {
         log.debug("Extracting reply from state, keys: {}", state.data().keySet());
         
-        // 优先从 messages 列表中获取最后一个助手消息
         Object messages = state.value("messages").orElse(null);
         if (messages != null) {
             String content = extractLastAssistantMessage(messages);
@@ -192,7 +282,6 @@ public class ChatController {
             }
         }
         
-        // 尝试从 output 获取
         Object output = state.value("output").orElse(null);
         if (output != null) {
             String content = extractContentFromObject(output);
@@ -201,7 +290,6 @@ public class ChatController {
             }
         }
 
-        // 尝试其他字段
         for (String key : List.of("result", "response")) {
             Object val = state.value(key).orElse(null);
             if (val != null) {
@@ -212,7 +300,6 @@ public class ChatController {
             }
         }
 
-        // 遍历所有数据
         Map<String, Object> allData = state.data();
         if (allData != null && !allData.isEmpty()) {
             for (Map.Entry<String, Object> entry : allData.entrySet()) {
@@ -227,24 +314,18 @@ public class ChatController {
         return "处理完成，但未获取到具体回复内容。";
     }
 
-    /**
-     * 从消息列表中提取最后一个助手消息的内容
-     */
     private String extractLastAssistantMessage(Object messages) {
         if (messages instanceof List<?> list && !list.isEmpty()) {
             log.debug("Messages list size: {}", list.size());
             
-            // 从后向前遍历，找到最后一个助手消息
             for (int i = list.size() - 1; i >= 0; i--) {
                 Object item = list.get(i);
                 String itemClassName = item.getClass().getName();
                 log.debug("Processing message item {} type: {}", i, itemClassName);
                 
-                // 只处理助手消息
                 if (itemClassName.contains("AssistantMessage") || itemClassName.contains("AIMessage")) {
                     String content = extractContentFromObject(item);
                     if (content != null && !content.isBlank()) {
-                        // 过滤掉简单的 "pong" 响应
                         if (!content.trim().equalsIgnoreCase("pong") && !content.trim().equalsIgnoreCase(" pong")) {
                             log.debug("Found valid assistant message at index {}: {}", i, content.length() > 200 ? content.substring(0, 200) + "..." : content);
                             return content;

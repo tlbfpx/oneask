@@ -17,7 +17,7 @@ spring:
           username: ${NACOS_USERNAME:nacos}
           password: ${NACOS_PASSWORD:}
           discovery:
-            enabled: true
+            enabled: false
           registry:
             enabled: false
         server:
@@ -33,3 +33,6 @@ logging:
     org.springframework.ai: DEBUG
   pattern:
     console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] [%X{traceId}] %-5level %logger{36} - %msg%n"
+
+customer-service:
+  url: ${CUSTOMER_SERVICE_URL:http://localhost:8081}
